@@ -1,0 +1,361 @@
+#!/bin/bash
+#
+# ollama_setup_revised_v2
+#
+# This script sets up and manages two LaunchDaemons for Ollama on macOS:
+#  1) Ensures "ollama serve" is always running via launchd (as root).
+#  2) Checks hourly via Homebrew for Ollama updates and restarts the service if updated.
+#
+# Features:
+#  - Idempotent: Safe to run multiple times.
+#  - Dynamic Paths: Automatically finds brew and ollama executables.
+#  - Proper Unload/Load: Ensures daemons are correctly managed.
+#  - Root Check: Requires sudo/root privileges.
+#  - Cleanup: Removes old versions before creating new ones.
+#  - Sets HOME for root daemon context.
+#  - Includes a basic service check after setup.
+#
+# Usage:
+#   sudo ./ollama_setup_revised_v2.sh
+#
+# Note on $HOME: This script configures Ollama to run as root and uses
+# /var/root as the HOME directory. Models will likely be stored under
+# /var/root/.ollama/models. If you prefer models in your user directory,
+# consider setting up Ollama as a User Agent (~/Library/LaunchAgents) instead.
+#
+
+# --- Configuration ---
+SERVE_LABEL="com.ollama.serve"
+UPDATE_LABEL="com.ollama.update"
+LOG_DIR="/var/log"
+DAEMON_DIR="/Library/LaunchDaemons"
+HELPER_SCRIPT_DIR="/usr/local/bin" # Standard location for local scripts
+
+SERVE_PLIST_PATH="${DAEMON_DIR}/${SERVE_LABEL}.plist"
+UPDATE_PLIST_PATH="${DAEMON_DIR}/${UPDATE_LABEL}.plist"
+UPDATE_SCRIPT_NAME="ollama_update_helper.sh"
+UPDATE_SCRIPT_PATH="${HELPER_SCRIPT_DIR}/${UPDATE_SCRIPT_NAME}"
+
+# --- Sanity Checks ---
+
+# 1. Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   echo "❌ This script must be run as root (e.g., using sudo)."
+   exit 1
+fi
+
+# 2. Find required commands
+echo "🔎 Locating dependencies..."
+BREW_PATH=$(which brew)
+if [[ -z "$BREW_PATH" ]]; then
+    echo "❌ Homebrew ('brew') command not found in PATH."
+    echo "   Please install Homebrew (https://brew.sh/) and ensure it's in the root user's PATH."
+    exit 1
+fi
+echo "   ✅ Found brew at: $BREW_PATH"
+
+# Use `command -v` which is slightly more robust than `which`
+OLLAMA_PATH=$(command -v ollama)
+if [[ -z "$OLLAMA_PATH" ]]; then
+    # Try default Homebrew path for ollama if `which` fails in root's minimal PATH
+    if [[ -x "/opt/homebrew/bin/ollama" ]]; then
+        OLLAMA_PATH="/opt/homebrew/bin/ollama"
+        echo "   ⚠️ 'ollama' not found in PATH, but found at default Homebrew location: $OLLAMA_PATH"
+    elif [[ -x "/usr/local/bin/ollama" ]]; then
+         OLLAMA_PATH="/usr/local/bin/ollama"
+         echo "   ⚠️ 'ollama' not found in PATH, but found at default system location: $OLLAMA_PATH"
+    else
+        echo "❌ Ollama ('ollama') command not found in PATH or common locations."
+        echo "   Please install Ollama (e.g., 'brew install ollama') and ensure it's runnable by root."
+        exit 1
+    fi
+fi
+echo "   ✅ Found ollama at: $OLLAMA_PATH"
+
+# --- Ensure Directories Exist ---
+mkdir -p "$LOG_DIR"
+mkdir -p "$DAEMON_DIR"
+mkdir -p "$HELPER_SCRIPT_DIR"
+echo "✅ Ensured directories exist: $LOG_DIR, $DAEMON_DIR, $HELPER_SCRIPT_DIR"
+
+# --- Teardown Existing Daemons (Idempotency & Cleanup) ---
+echo "🔄 Unloading existing daemons (if any) to ensure a clean state..."
+
+# Unload and remove the update daemon first
+if [[ -f "$UPDATE_PLIST_PATH" ]]; then
+    launchctl unload -w "$UPDATE_PLIST_PATH" &>/dev/null # Suppress errors if not loaded
+    rm -f "$UPDATE_PLIST_PATH"
+    echo "   🗑️ Removed existing update plist: $UPDATE_PLIST_PATH"
+fi
+
+# Unload and remove the serve daemon
+if [[ -f "$SERVE_PLIST_PATH" ]]; then
+    launchctl unload -w "$SERVE_PLIST_PATH" &>/dev/null # Suppress errors if not loaded
+    rm -f "$SERVE_PLIST_PATH"
+    echo "   🗑️ Removed existing serve plist: $SERVE_PLIST_PATH"
+fi
+
+# Remove old helper script if it exists
+if [[ -f "$UPDATE_SCRIPT_PATH" ]]; then
+    rm -f "$UPDATE_SCRIPT_PATH"
+    echo "   🗑️ Removed existing helper script: $UPDATE_SCRIPT_PATH"
+fi
+
+# --- Create Helper Update Script ---
+echo "📝 Creating Ollama update helper script..."
+cat << EOF > "$UPDATE_SCRIPT_PATH"
+#!/bin/bash
+# Helper script executed by ${UPDATE_LABEL}.plist
+
+# Log file for this script's actions
+LOG_FILE="${LOG_DIR}/${UPDATE_LABEL}.log"
+exec >> "\$LOG_FILE" 2>&1 # Redirect stdout/stderr to log file
+
+echo "--- \$(date): Starting Ollama update check ---"
+
+# Use the paths found by the main setup script
+BREW_CMD="$BREW_PATH"
+OLLAMA_CMD="$OLLAMA_PATH"
+SERVE_PLIST="$SERVE_PLIST_PATH" # Path to the service plist
+SERVE_LABEL="$SERVE_LABEL"
+
+# Ensure required commands are available within this script's context
+if ! command -v "\$BREW_CMD" >/dev/null; then
+    echo "   ❌ Brew command ('\$BREW_CMD') not found. Cannot check for updates."
+    echo "--- \$(date): Finished Ollama update check (Error) ---"
+    exit 1
+fi
+if ! command -v "\$OLLAMA_CMD" >/dev/null; then
+    echo "   ❌ Ollama command ('\$OLLAMA_CMD') not found. Cannot manage service."
+    echo "--- \$(date): Finished Ollama update check (Error) ---"
+    exit 1
+fi
+if ! command -v launchctl >/dev/null; then
+    echo "   ❌ launchctl command not found. Cannot manage service."
+    echo "--- \$(date): Finished Ollama update check (Error) ---"
+    exit 1
+fi
+
+
+# Check if Ollama is managed by Homebrew
+if ! "\$BREW_CMD" list ollama &>/dev/null; then
+    echo "   ⚠️ Ollama does not seem to be installed via Homebrew. Skipping Homebrew update check."
+    echo "--- \$(date): Finished Ollama update check (skipped Homebrew) ---"
+    exit 0
+fi
+
+echo "   🔄 Running 'brew update'..."
+if ! "\$BREW_CMD" update; then
+    echo "   ❌ 'brew update' failed. Continuing with outdated check anyway..."
+    # Decide if you want to exit or continue to upgrade attempt - currently continues
+fi
+
+echo "   🔎 Checking for Ollama updates using 'brew outdated ollama'..."
+# Check if 'ollama' is listed in outdated packages
+OUTDATED_OUTPUT=\$("\$BREW_CMD" outdated ollama 2>/dev/null)
+if [[ $? -eq 0 && -n "\$OUTDATED_OUTPUT" && "\$OUTDATED_OUTPUT" == *"ollama"* ]]; then
+    echo "   ⬆️ Ollama update found via Homebrew. Attempting upgrade..."
+    if "\$BREW_CMD" upgrade ollama; then
+        echo "   ✅ Ollama upgraded successfully via Homebrew. Restarting service..."
+        # Use bootstrap/bootout which is more modern than load/unload for daemons
+        if launchctl bootout system/"\$SERVE_LABEL"; then
+             echo "      ✓ Service stopped (bootout)."
+             sleep 3 # Give it a moment to fully stop
+             if launchctl bootstrap system "\$SERVE_PLIST"; then
+                 echo "      🚀 Service started (bootstrap)."
+             else
+                 echo "      ❌ Failed to start service using launchctl bootstrap."
+             fi
+        else
+             echo "   ⚠️ Failed to stop service using launchctl bootout. Attempting unload/load..."
+             # Fallback to unload/load
+             if launchctl unload -w "\$SERVE_PLIST"; then
+                echo "      ✓ Service unloaded."
+                sleep 3 # Give it a moment
+                if launchctl load -w "\$SERVE_PLIST"; then
+                    echo "      🚀 Service reloaded."
+                else
+                    echo "      ❌ Failed to reload service using launchctl load."
+                fi
+             else
+                 echo "   ❌ Failed to unload service using launchctl unload."
+             fi
+        fi
+    else
+        echo "   ❌ Ollama Homebrew upgrade failed."
+    fi
+else
+    echo "   👍 Ollama (Homebrew package) is up-to-date or not found in outdated list."
+fi
+
+echo "--- \$(date): Finished Ollama update check ---"
+exit 0
+EOF
+
+# Set permissions for the helper script
+chmod 755 "$UPDATE_SCRIPT_PATH"
+chown root:wheel "$UPDATE_SCRIPT_PATH"
+echo "   ✅ Created helper script: $UPDATE_SCRIPT_PATH"
+
+# --- Create Serve LaunchDaemon ---
+echo "📝 Creating Ollama serve LaunchDaemon plist..."
+cat << EOF > "$SERVE_PLIST_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${SERVE_LABEL}</string>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/var/root</string>
+        <key>OLLAMA_HOST</key>
+        <string>0.0.0.0:11434</string>
+        </dict>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${OLLAMA_PATH}</string>
+        <string>serve</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/${SERVE_LABEL}.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/${SERVE_LABEL}.err.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+</dict>
+</plist>
+EOF
+
+# Set permissions for the serve plist
+chmod 644 "$SERVE_PLIST_PATH"
+chown root:wheel "$SERVE_PLIST_PATH"
+echo "   ✅ Created serve plist: $SERVE_PLIST_PATH"
+
+# --- Create Update LaunchDaemon ---
+echo "📝 Creating Ollama update LaunchDaemon plist..."
+cat << EOF > "$UPDATE_PLIST_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${UPDATE_LABEL}</string>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${UPDATE_SCRIPT_PATH}</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/${UPDATE_LABEL}.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/${UPDATE_LABEL}.err.log</string>
+</dict>
+</plist>
+EOF
+
+# Set permissions for the update plist
+chmod 644 "$UPDATE_PLIST_PATH"
+chown root:wheel "$UPDATE_PLIST_PATH"
+echo "   ✅ Created update plist: $UPDATE_PLIST_PATH"
+
+# --- Load Daemons ---
+echo "🚀 Loading and enabling LaunchDaemons..."
+
+# Load the serve daemon first
+# Using bootstrap/bootout is preferred for system daemons
+if launchctl bootstrap system "$SERVE_PLIST_PATH"; then
+    echo "   ✅ Loaded and enabled (bootstrap): ${SERVE_LABEL}"
+else
+    # Fallback to load if bootstrap fails (might happen on older macOS?)
+    if launchctl load -w "$SERVE_PLIST_PATH"; then
+         echo "   ✅ Loaded and enabled (load -w fallback): ${SERVE_LABEL}"
+    else
+        echo "   ❌ Failed to load/enable: ${SERVE_LABEL}. Check logs and system console (sudo launchctl error <errno>)."
+        # Exit if the main service fails to load, as the rest depends on it.
+        exit 1
+    fi
+fi
+
+# Load the update daemon
+if launchctl bootstrap system "$UPDATE_PLIST_PATH"; then
+    echo "   ✅ Loaded and enabled (bootstrap): ${UPDATE_LABEL}"
+else
+     # Fallback to load if bootstrap fails
+    if launchctl load -w "$UPDATE_PLIST_PATH"; then
+         echo "   ✅ Loaded and enabled (load -w fallback): ${UPDATE_LABEL}"
+    else
+        echo "   ❌ Failed to load/enable: ${UPDATE_LABEL}. Check logs and system console."
+        # Don't necessarily exit if the updater fails, main service might still work.
+    fi
+fi
+
+# --- Test Service ---
+echo "⏱️ Waiting a few seconds for the service to initialize..."
+sleep 8 # Give ollama serve time to start up
+
+echo "🧪 Attempting to connect to the Ollama service with '${OLLAMA_PATH} list'..."
+if "$OLLAMA_PATH" list > /dev/null 2>&1; then
+    echo "   ✅ Success! Connected to Ollama service."
+    # You can uncomment the next line if you want to see the actual list output
+    # "$OLLAMA_PATH" list
+else
+    echo "   ❌ Failed to connect to the Ollama service."
+    echo "      Please check the logs for errors:"
+    echo "      Serve Stderr: ${LOG_DIR}/${SERVE_LABEL}.err.log"
+    echo "      Serve Stdout: ${LOG_DIR}/${SERVE_LABEL}.out.log"
+    echo "      Also check system logs: log show --predicate 'process == \"launchd\" or process == \"ollama\"' --last 5m"
+    # Indicate potential failure with exit code
+    EXIT_CODE=1
+fi
+
+
+echo ""
+echo "------------------------------------------------------"
+if [[ $EXIT_CODE -ne 0 ]]; then
+ echo "⚠️ Ollama LaunchDaemon setup completed, but the service test failed."
+else
+ echo "✅ Ollama LaunchDaemon setup complete!"
+fi
+echo "   - Service (${SERVE_LABEL}) should be running 'ollama serve'."
+echo "   - Updater (${UPDATE_LABEL}) will check for updates hourly (and ran once just now)."
+echo ""
+echo "ℹ️  Check status with:"
+echo "   sudo launchctl list | grep ollama"
+echo "   sudo launchctl print system/${SERVE_LABEL}"
+echo ""
+echo "ℹ️  Check logs for details:"
+echo "   Serve Stdout:       ${LOG_DIR}/${SERVE_LABEL}.out.log"
+echo "   Serve Stderr:       ${LOG_DIR}/${SERVE_LABEL}.err.log"
+echo "   Update Helper Log:  ${LOG_DIR}/${UPDATE_LABEL}.log"
+echo "   Update Daemon Stdout: ${LOG_DIR}/${UPDATE_LABEL}.out.log"
+echo "   Update Daemon Stderr: ${LOG_DIR}/${UPDATE_LABEL}.err.log"
+echo ""
+echo "ℹ️  To Stop/Start Manually:"
+echo "   Stop:  sudo launchctl bootout system/${SERVE_LABEL}"
+echo "   Start: sudo launchctl bootstrap system ${SERVE_PLIST_PATH}"
+echo "   (Or use unload/load -w if bootstrap fails)"
+echo ""
+echo "✨ Done!"
+exit ${EXIT_CODE:-0} # Exit with 0 if success, 1 if test failed
