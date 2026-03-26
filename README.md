@@ -80,3 +80,7 @@ To remove the LaunchDaemons created by this script, you'll need to manually remo
 
 *   This script configures Ollama to run as root.  Models will be stored under `/var/root/.ollama/models`. If you prefer models in your user directory, consider setting up Ollama as a User Agent instead.  This script is not designed for User Agent setup.
 *   Ensure Homebrew and Ollama are correctly installed before running the script.
+
+## License
+
+This project is licensed under [CC BY-NC 4.0](https://darren-static.waft.dev) - free to use and modify, but no commercial use without permission.
